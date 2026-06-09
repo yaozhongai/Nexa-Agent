@@ -1,0 +1,77 @@
+# ==========================================
+# Nexa Agent — .gitignore
+# ==========================================
+
+# 环境变量 (含 API Key)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── 项目数据 ──
+# 数据库 + 上传文件 (全部在 data/ 下)
+data/
+
+# ── 日志 ──
+logs/
+*.log
+
+# ── 上传文件目录 ──
+uploads/
+
+# ── 测试图片 / 临时文件 ──
+# 防止测试时把图片散落在项目根目录
+/*.png
+/*.jpg
+/*.jpeg
+/*.pdf
+/*.gif
+/*.webp
+/*.bmp
+
+# 临时文件
+*.tmp
+*.bak
+*.cache
+*.orig
+
+# ── Claude Code ──
+.claude/
+
+# ── 脚本 / 运维文件 ──
+scripts/
+
+# ── 其他中间产物 ──
+*.db-shm
+*.db-wal
