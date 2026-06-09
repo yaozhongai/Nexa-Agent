@@ -1,6 +1,6 @@
 # 项目规范：Nexa Agent V0
 
-> 版本：V1.0 | 日期：2026-06-09 | 状态：V0 功能完成，V1 规划中
+> 版本：V1.1 | 日期：2026-06-10 | 状态：V0 功能完成，STM Schema 落地，V1 规划中
 
 ---
 
@@ -33,7 +33,8 @@ Nexa Agent V0 是一个 **LangGraph 原生、两层路由驱动、带完整 Trac
 | 票据图片直答 | ✅ 已实现 | VLM 0-LLM 路径，~0.5s 延迟 |
 | 图片预识别缓存 | ✅ 已实现 | 上传后一次 VLM 识别，后续图片问答复用 `vlm_text` |
 | 票据字段结构化提取 | ✅ 已实现 | JSON 输出，自动校验金额/日期格式 |
-| RAG 检索增强 | ✅ 已实现 | 短期记忆 + 长期记忆检索 |
+| RAG 检索增强 | ✅ 已实现 | STM（会话上下文）+ LTM（历史票据/偏好）分层检索 |
+| 短期记忆管理 | ✅ 已实现 | Session/Turn/Entry 模型，上下文裁剪，write_from_state |
 | LLM 推理 + 校验 | ✅ 已实现 | 复杂推理触发 L2 Verifier |
 | Agent 工作流 | ✅ 已实现 | LangGraph StateGraph 编排 |
 | 执行轨迹可视化 | ✅ 已实现 | Trace + SSE + Timeline |
@@ -54,8 +55,10 @@ Nexa Agent V0 是一个 **LangGraph 原生、两层路由驱动、带完整 Trac
 - [x] 上传后图片预识别缓存：`/api/v0/files/analyze` + `image_analysis_cache`
 - [x] LLM：DeepSeek V4（v4-pro / v4-flash）/ Kimi K2.6 / GLM-5.1
 - [x] 校验器：L1 规则校验 + L2 LLM Verifier（仅复杂推理触发）
-- [x] 短期记忆（内存 LRU）+ 长期记忆（SQLAlchemy + SQLite）
-- [x] 记忆门控写入（VISION_DIRECT 不写，VISION_SCHEMA 仅写票据数据）
+- [x] STM Schema 数据模型（枚举 + Pydantic，对齐 STM Schema）
+- [x] 短期记忆 Store（session/turn/entry + 上下文裁剪 + write_from_state）
+- [x] 长期记忆（SQLAlchemy + SQLite）
+- [x] 记忆门控写入（VISION_DIRECT 不写，VISION_SCHEMA 写票据数据）
 - [x] FastAPI（:8000）+ Streamlit（:8501）+ CLI
 - [x] 完整 Trace 系统（agent_trace_runs / agent_trace_events / SSE / Timeline）
 - [x] .env 配置 + Makefile 一键启动
@@ -173,13 +176,14 @@ Nexa_Agent/
 │   │   ├── routers.py              # conditional edge 路由函数
 │   │   └── nodes/
 │   │       ├── normalize.py        # 归一化（Observation + 状态推进）
+│   │       ├── load_context.py     # 加载短期记忆上下文
 │   │       ├── route.py            # L1 规则 + L2 DeepSeek V4 Flash
 │   │       ├── vision.py           # VLM 直答 / 结构化 / 感知
 │   │       ├── retrieve.py         # 记忆检索
 │   │       ├── reason.py           # LLM 推理
 │   │       ├── verify.py           # L1 规则校验 + L2 LLM Verifier
 │   │       ├── respond.py          # 最终响应
-│   │       ├── memory.py           # 记忆持久化（门控）
+│   │       ├── memory.py           # 记忆持久化（门控，失败不阻断）
 │   │       └── fallback.py         # 兜底
 │   ├── trace/                      # Trace 事件系统
 │   │   ├── schema.py               # Trace 枚举 + Pydantic 模型 + Payload
@@ -199,12 +203,13 @@ Nexa_Agent/
 │   │       ├── upload.py           # POST /api/v0/upload
 │   │       ├── memory.py           # GET/DELETE /api/v0/memory/*
 │   │       └── trace.py            # GET /api/v0/trace/*（SSE + Timeline）
-│   ├── memory/                     # 短期 + 长期记忆
-│   │   ├── short_term.py           # 内存 LRU（max_turns=20）
-│   │   └── long_term.py            # SQLAlchemy CRUD
+│   ├── memory/                     # 短期记忆（STM Schema）+ 长期记忆
+│   │   ├── stm_schema.py           # 枚举 + Pydantic 模型（对齐 STM Schema）
+│   │   ├── short_term.py           # STM Store（turn/entry/session/上下文裁剪）
+│   │   └── long_term.py            # LTM Store（SQLAlchemy CRUD）
 │   ├── pipeline/                   # VLM + 提取管线
 │   │   ├── vlm.py                  # BaseVLMEngine 抽象 + VLMResult
-│   │   ├── ollama_vlm.py           # llama.cpp / Ollama VLM 引擎
+│   │   ├── llamacpp_vlm.py         # llama.cpp VLM 引擎
 │   │   ├── extractor.py            # ExtractionPipeline
 │   ├── utils/                      # 工具
 │   │   ├── logger_config.py        # 统一日志配置
@@ -252,6 +257,7 @@ graph TD
         SG["LangGraph StateGraph"]
         STATE["AgentState TypedDict"]
         NORM["normalize_input"]
+        LOAD["load_short_term_context"]
         ROUTE["route_task"]
         V_DIR["vision_direct"]
         V_SCH["vision_schema"]
@@ -286,7 +292,8 @@ graph TD
     CLI -->|直接调用| SG
     CHAT --> SG
     SG --> STATE
-    NORM --> ROUTE
+    NORM --> LOAD
+    LOAD --> ROUTE
     ROUTE --> V_DIR
     ROUTE --> V_SCH
     ROUTE --> V_PER
@@ -336,13 +343,16 @@ graph TD
 4. compiled_graph.invoke(state, config)
       │
       ▼
-5. normalize_input        → Observation + status=NORMALIZED
+5. normalize_input            → Observation + status=NORMALIZED
       │
       ▼
-6. route_task             → L1 关键词规则 → 置信度 < 0.9? → L2 DeepSeek V4 Flash
-      │                     RouteResult(route_type, confidence, need_*)
+6. load_short_term_context    → 读取短期记忆 → short_term_context
+      │
       ▼
-7. conditional edge (route_after_task)
+7. route_task                 → L1 关键词规则 → 置信度 < 0.9? → L2 DeepSeek V4 Flash
+      │                         RouteResult(route_type, confidence, need_*)
+      ▼
+8. conditional edge (route_after_task)
       │
       ├── VISION_DIRECT  → vision_direct  → validate_direct
       ├── VISION_SCHEMA  → vision_schema  → validate_schema
@@ -352,20 +362,21 @@ graph TD
       └── FALLBACK       → fallback
       │
       ▼
-8. respond                → final_answer 确认
+9. respond                    → final_answer 确认
       │
       ▼
-9. update_memory          → 门控写入（STM + LTM，VISION_SCHEMA 额外保存票据）
+10. update_memory              → STM 始终写入（write_from_state: turn + entry 结构化，失败不阻断）
+         │                         LTM 由 need_memory_write 门控（消息 + 票据，失败不阻断）
       │
       ▼
-10. END → result (AgentState)
+11. END → result (AgentState)
       │
       ▼
-11. FastAPI to_public_response(result)
+12. FastAPI to_public_response(result)
       │  从 action_trace 发射 Trace 事件
       │  complete_trace_run()
       ▼
-12. ChatResponse JSON → Streamlit 渲染
+13. ChatResponse JSON → Streamlit 渲染
       │  用户消息卡片 + 助手回答卡片
       │  展开详情 → GET /api/v0/trace/{id}/timeline → 管道流展示
 ```
@@ -389,15 +400,16 @@ graph TD
 
 ### 5.3 LLM / VLM 调用次数
 
-| 路径 | LLM 调用 | VLM 调用 | Verify | Memory Write |
-|------|----------|----------|--------|--------------|
-| VISION_DIRECT | 0 | 1 | ❌ | ❌ |
-| Cached Image QA（已有 `vlm_text`） | 1 | 0 | ❌ | ❌ |
-| VISION_SCHEMA | 0 | 1 | ❌ | ✅ (票据数据) |
-| RAG_QA（纯文本） | 1 | 0 | ❌ | ❌ |
-| RAG_QA（有图+推理） | 1-2 | 1 | ✅ (need_verify=True) | ❌ |
-| TOOL_ACT | 0 | 0 | — | V1 |
-| FALLBACK | 0 | 0 | ❌ | ❌ |
+| 路径 | LLM 调用 | VLM 调用 | Verify | STM | LTM |
+|------|----------|----------|--------|-----|-----|
+| VISION_DIRECT | 0 | 1 | ❌ | ✅ | ❌ |
+| Cached Image QA（已有 `vlm_text`） | 1 | 0 | ❌ | ✅ | ❌ |
+| VISION_SCHEMA | 0 | 1 | ❌ | ✅ | ✅ (票据数据) |
+| RAG_QA（纯文本） | 1 | 0 | ❌ | ✅ | ❌ |
+| RAG_QA（有图+推理） | 1-2 | 1 | ✅ | ✅ | ❌ |
+| TOOL_ACT | 0 | 0 | — | ✅ | V1 |
+| FALLBACK | 0 | 0 | ❌ | ✅ | ❌ |
+> **STM 每轮对话始终写入**，不受 `need_memory_write` 门控。LTM 仅 `need_memory_write=True` 时写入。
 
 ---
 
@@ -457,7 +469,7 @@ graph TD
 ### 6.4 `agent/graph.py` — LangGraph 主图
 
 - **函数**: `build_agent_graph()` → `get_graph()`（全局编译单例）
-- **14 个注册节点**: normalize_input, route_task, vision_direct, vision_schema, vision_perceive, validate_direct, validate_schema, retrieve, reason, verify, respond, update_memory, fallback, tool_act_placeholder
+- **15 个注册节点**: normalize_input, load_short_term_context, route_task, vision_direct, vision_schema, vision_perceive, validate_direct, validate_schema, retrieve, reason, verify, respond, update_memory, fallback, tool_act_placeholder
 - **入口**: `normalize_input`
 - **条件边**:
   - `route_after_task` → 按 RouteType + has_image 分发
@@ -470,17 +482,18 @@ graph TD
 | 文件 | 节点 | 职责 |
 |------|------|------|
 | `normalize.py` | `normalize_input` | 记录 Observation，推进状态到 NORMALIZED |
-| `route.py` | `route_task` | L1 规则 + L2 DeepSeek V4 Flash，映射旧 RouteType → 新 RouteType |
+| `load_context.py` | `load_short_term_context` | 调用 STM.get_recent_context()，注入 short_term_context（5 字段） |
+| `route.py` | `route_task` | L1 规则 + L2 DeepSeek V4 Flash |
 | `vision.py` | `vision_direct` | VLM 自然语言直答；若命中 `active_file.vlm_text`，改用已识别文本进行 cached image QA |
 | `vision.py` | `vision_schema` | VLM 结构化 JSON 提取；若命中 `active_file.structured_data`，复用缓存 |
 | `vision.py` | `vision_perceive` | VLM 感知（为 RAG_QA+图片 提供上下文）；若命中 `active_file.vlm_text`，不再调用 VLM |
 | `retrieve.py` | `retrieve` | 读取短期记忆 + 长期记忆，need_retrieve 门控 |
-| `reason.py` | `reason` | LLM 推理，拼接 VLM 感知结果到 context |
+| `reason.py` | `reason` | LLM 推理，拼接 VLM 感知 + STM 上下文，observer/tool 角色映射为 user |
 | `verify.py` | `validate_direct` | L1 规则校验（非空、无失败标记） |
 | `verify.py` | `validate_schema` | L1 规则校验（JSON 解析 + 字段格式） |
 | `verify.py` | `verify` | L2 LLM Verifier（passed/score/issues/revised_answer） |
 | `respond.py` | `respond` | 确认 final_answer |
-| `memory.py` | `update_memory` | 门控持久化（need_memory_write） |
+| `memory.py` | `update_memory` | STM.write_from_state() + LTM 持久化（门控，失败不阻断） |
 | `fallback.py` | `fallback` | 兜底响应 |
 
 **节点契约**:
@@ -496,7 +509,6 @@ def node_name(state: AgentState) -> dict:
 
 | 函数 | 触发位置 | 逻辑 |
 |------|----------|------|
-| `route_after_normalize` | normalize_input 后 | → route_task |
 | `route_after_task` | route_task 后 | 按 RouteType + has_image 分发到对应 vision/retrieve/tool/fallback |
 | `route_after_reason` | reason 后 | need_verify ? verify : respond |
 | `route_after_verify` | verify 后 | 未通过 + step_count < max_steps ? reason : respond |
@@ -517,8 +529,8 @@ def node_name(state: AgentState) -> dict:
 
 ### 6.8 `pipeline/` — VLM 引擎 + 提取管线
 
-- **文件**: `app/pipeline/ollama_vlm.py`
-- **实现**: `OllamaVLMEngine`，继承 `BaseVLMEngine`
+- **文件**: `app/pipeline/llamacpp_vlm.py`
+- **实现**: `LlamaCppVLMEngine`，继承 `BaseVLMEngine`
 - **调用方式**: OpenAI 兼容 API → `http://127.0.0.1:8080/v1`
 - **图片格式**: base64 编码，`data:image/xxx;base64,...` 多模态消息
 - **模型**: MiniCPM-V，ctx_size=4096
@@ -528,8 +540,16 @@ def node_name(state: AgentState) -> dict:
 
 | 组件 | 文件 | 存储 | 生命周期 |
 |------|------|------|----------|
-| 短期记忆 | `short_term.py` | 内存 OrderedDict | 单次会话 |
-| 长期记忆 | `long_term.py` | SQLAlchemy + SQLite | 持久化 |
+| STM 数据模型 | `stm_schema.py` | 枚举 + Pydantic（对齐 STM Schema） | — |
+| 短期记忆 Store | `short_term.py` | 内存（session/turn/entry） | 单次会话，TTL 过期 |
+| 长期记忆 Store | `long_term.py` | SQLAlchemy + SQLite | 持久化 |
+
+**STM 核心功能**：
+- 会话生命周期管理（active/suspended/archived/expired）
+- 对话轮次跟踪（Turn）+ 细粒度条目存储（Entry）
+- 上下文裁剪：**Turn 级别整轮丢弃**（保证 QA 对完整），当前轮永不丢弃，token budget 控制字符总量
+- write_from_state 结构化写入（每轮始终执行，不受 `need_memory_write` 门控）
+- 后端日志 + Trace event 同步展示 STM 上下文摘要
 
 ### 6.10 `trace/` — 执行轨迹系统
 

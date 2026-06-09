@@ -954,6 +954,8 @@ def _event_detail_html(event: dict) -> str:
     ]
     if event.get("message"):
         details.append(f"message: {event.get('message')}")
+    if event.get("output_summary"):
+        details.append(f"output_summary: {event.get('output_summary')}")
     if event.get("error_message"):
         details.append(f"error_message: {event.get('error_message')}")
 

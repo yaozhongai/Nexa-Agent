@@ -218,6 +218,8 @@ compiled_graph.invoke() / compiled_graph.stream()
   ↓
 normalize_input
   ↓
+load_short_term_context
+  ↓
 route_task
   ↓
 conditional edge
@@ -1068,6 +1070,8 @@ def route_after_task(state: AgentState) -> str:
 START
   ↓
 normalize_input
+  ↓
+load_short_term_context
   ↓
 route_task
   ↓

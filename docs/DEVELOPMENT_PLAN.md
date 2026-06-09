@@ -1,6 +1,6 @@
 # Nexa Agent 开发规划
 
-> 版本：V1.1 | 日期：2026-06-09
+> 版本：V1.2 | 日期：2026-06-10
 
 ---
 
@@ -30,8 +30,11 @@ Direct First, Agent When Needed
 | VLM (llama.cpp + MiniCPM-V, OpenAI SDK) | ✅ |
 | LLM (DeepSeek V4 / Kimi K2.6 / GLM-5.1) | ✅ |
 | 校验器 (L1 规则 + L2 LLM Verifier, 仅复杂推理触发) | ✅ |
-| 短期记忆 (内存 LRU) + 长期记忆 (SQLite + agent_runs/traces) | ✅ |
-| 记忆门控写入 (VISION_DIRECT 不写, VISION_SCHEMA 仅写票据数据) | ✅ |
+| 短期记忆 STM Schema (session/turn/entry + Turn 级别上下文裁剪) + 长期记忆 (SQLAlchemy) | ✅ |
+| STM 始终写入 (每轮对话) / LTM 按 need_memory_write 门控 | ✅ |
+| `load_short_term_context` 节点 (Trace + 日志双通道展示 STM 内容) | ✅ |
+| STM role → LLM role 映射 (observer/tool → user) | ✅ |
+| 旧架构清理 (StateContext / Handler / AgentStateMachine 已删除) | ✅ |
 | FastAPI (:8000) + Streamlit (:8501) + CLI | ✅ |
 | .env 配置 + Makefile | ✅ |
 | 旧架构清理 (StateContext / Handler / AgentStateMachine 已删除) | ✅ |

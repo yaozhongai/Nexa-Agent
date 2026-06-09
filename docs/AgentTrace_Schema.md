@@ -1,6 +1,6 @@
 # Agent Trace Schema 设计文档
 
-> 版本：V0.1
+> 版本：V0.2 | 日期：2026-06-10 | 已实现：STM 上下文摘要通过 trace event 的 message / output_summary 字段对外展示
 > 目标：为 Nexa Agent 的执行轨迹可视化、SSE 流式推送、节点调试和后续 ReAct 轨迹承载提供统一 Schema
 > 原则：AgentState 负责状态协议，Agent Trace 负责过程轨迹；两者边界清晰，不互相替代
 
@@ -93,6 +93,8 @@ complete_trace_run()
 ```text
 normalize_input
      ↓
+load_short_term_context
+     ↓
 route_task
      │
      ├── VISION_DIRECT: vision_direct → validate_direct
@@ -108,6 +110,10 @@ route_task
                                                 ↓
                                                END
 ```
+
+> **V0 限制**：Trace 事件在 `graph.invoke()` 完成后统一批量发射（非流式）。
+> SSE 订阅者在 invoke 完成前无法收到中间事件。
+> 实时流式 Trace 将在后续通过 `graph.astream_events()` 实现。
 
 ### 2.3 Trace 事件产生位置
 
@@ -338,6 +344,7 @@ class TraceVisibility(str, Enum):
 ```python
 class TraceNodeName(str, Enum):
     NORMALIZE_INPUT = "normalize_input"
+    LOAD_SHORT_TERM_CONTEXT = "load_short_term_context"
     ROUTE_TASK = "route_task"
 
     VISION_DIRECT = "vision_direct"
@@ -705,13 +712,14 @@ class ToolCallTracePayload(BaseModel):
 | 节点名 | 主要事件 | 关键 payload |
 | ----- | ----- | ----- |
 | `normalize_input` | `node_started` / `node_completed` | 输入类型、是否有图片、是否有文件 |
+| `load_short_term_context` | `node_started` / `memory_read_completed` / `node_completed` | `RetrievalTracePayload`（读 STM），`output_summary` 含上下文摘要，后端日志同步输出 |
 | `route_task` | `node_started` / `route_decided` / `node_completed` | `RouteTracePayload` |
 | `vision_direct` | `node_started` / `model_call_started` / `model_call_completed` / `node_completed` | `ModelCallTracePayload` |
 | `vision_schema` | `node_started` / `model_call_started` / `model_call_completed` / `node_completed` | `ModelCallTracePayload` |
 | `vision_perceive` | `node_started` / `model_call_started` / `model_call_completed` / `node_completed` | `ModelCallTracePayload` |
 | `validate_direct` | `node_started` / `validation_completed` / `node_completed` | `ValidationTracePayload` |
 | `validate_schema` | `node_started` / `validation_completed` / `node_completed` | `ValidationTracePayload` |
-| `retrieve` | `node_started` / `memory_read_completed` / `retrieval_completed` / `node_completed` | `RetrievalTracePayload` |
+| `retrieve` | `node_started` / `retrieval_completed` / `node_completed` | `RetrievalTracePayload`（读 LTM） |
 | `reason` | `node_started` / `model_call_started` / `model_call_completed` / `node_completed` | `ModelCallTracePayload` |
 | `verify` | `node_started` / `model_call_started` / `validation_completed` / `node_completed` | `ValidationTracePayload` |
 | `respond` | `node_started` / `node_completed` | final_answer 摘要 |

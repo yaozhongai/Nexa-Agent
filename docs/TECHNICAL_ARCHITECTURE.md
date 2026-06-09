@@ -1,6 +1,6 @@
 # Nexa Agent V0 — 技术架构文档
 
-> 版本：V3.3 | 日期：2026-06-09 | 架构：LangGraph 原生 + 两层路由 + Trace
+> 版本：V3.4 | 日期：2026-06-10 | 架构：LangGraph 原生 + 两层路由 + Trace + STM Schema
 
 ---
 
@@ -22,13 +22,14 @@ app/
 │   ├── routers.py              # conditional edge
 │   └── nodes/
 │       ├── normalize.py        # 归一化 (Observation + 状态推进)
+│       ├── load_context.py     # 加载短期记忆上下文
 │       ├── route.py            # L1 规则 + L2 DeepSeek V4 Flash
 │       ├── vision.py           # VLM 直答 / 结构化 / 感知
 │       ├── retrieve.py         # 记忆检索
 │       ├── reason.py           # LLM 推理
 │       ├── verify.py           # L1 规则校验 + L2 LLM Verifier
 │       ├── respond.py          # 最终响应
-│       ├── memory.py           # 记忆持久化 (门控)
+│       ├── memory.py           # 记忆持久化 (门控，含异常保护)
 │       └── fallback.py         # 兜底
 ├── trace/                      # Trace 事件系统
 │   ├── schema.py               # Trace 枚举 + 模型 + Payload
@@ -48,8 +49,11 @@ app/
 │       ├── upload.py           # POST /api/v0/upload
 │       ├── memory.py           # GET /api/v0/memory/*
 │       └── trace.py            # GET /api/v0/trace/* (SSE + Timeline)
-├── memory/                     # 短期 (LRU) + 长期 (SQLAlchemy)
-├── pipeline/                   # VLM 引擎 + 提取管线
+├── memory/                     # 短期记忆 (STM Schema) + 长期记忆
+│   ├── stm_schema.py           # 枚举 + Pydantic 模型
+│   ├── short_term.py           # STM Store (turn/entry/session)
+│   └── long_term.py            # LTM Store (SQLAlchemy CRUD)
+├── pipeline/                   # llama.cpp VLM 引擎 + 提取管线
 ├── utils/                      # 日志 + 路由规则 + 校验
 ├── main.py / cli.py / streamlit_app.py
 └── .env / Makefile / .env.example
@@ -60,7 +64,7 @@ app/
 ## 3. 两层路由 + 5 条路径
 
 ```
-normalize_input → route_task (L1规则 + L2 DeepSeek V4 Flash)
+normalize_input → load_short_term_context → route_task (L1规则 + L2 DeepSeek V4 Flash)
                       │
         ┌─────────────┼─────────────┬──────────────┐
         ▼             ▼             ▼              ▼
@@ -81,13 +85,14 @@ normalize_input → route_task (L1规则 + L2 DeepSeek V4 Flash)
             END
 ```
 
-| 路径 | LLM | VLM | Verify | Memory |
-|------|-----|-----|--------|--------|
-| VISION_DIRECT | 0 | 1 | ❌ | ❌ |
-| VISION_SCHEMA | 0 | 1 | ❌ | ✅ |
-| RAG_QA (纯文本) | 1 | 0 | ❌ | ❌ |
-| RAG_QA (有图+推理) | 1-2 | 1 | ✅ | ❌ |
-| TOOL_ACT | — | — | — | V1 |
+| 路径 | LLM | VLM | Verify | STM | LTM |
+|------|-----|-----|--------|-----|-----|
+| VISION_DIRECT | 0 | 1 | ❌ | ✅ | ❌ |
+| VISION_SCHEMA | 0 | 1 | ❌ | ✅ | ✅ |
+| RAG_QA (纯文本) | 1 | 0 | ❌ | ✅ | ❌ |
+| RAG_QA (有图+推理) | 1-2 | 1 | ✅ | ✅ | ❌ |
+| TOOL_ACT | — | — | — | — | V1 |
+> **STM 每轮始终写入，LTM 仅 need_memory_write=True 时写入。**
 
 ---
 

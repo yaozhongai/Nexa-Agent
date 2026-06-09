@@ -61,6 +61,9 @@ async def timeline(trace_id: str):
                 "status": i.status.value,
                 "duration_ms": i.duration_ms,
                 "event_count": len(i.events),
+                # 取最近一条 event 的 message / output_summary
+                "message": i.events[-1].message if i.events else None,
+                "output_summary": i.events[-1].output_summary if i.events else None,
             }
             for i in items
         ],

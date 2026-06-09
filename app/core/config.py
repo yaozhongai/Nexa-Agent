@@ -85,7 +85,8 @@ class AppConfig:
     vlm_ctx_size: int = 4096
 
     # --- 记忆 ---
-    short_term_max_turns: int = 20
+    stm_max_sessions: int = 1000        # STM 最大同时会话数
+    stm_session_ttl_seconds: int = 3600  # STM 会话过期时间
     long_term_sync_interval: int = 10
 
     # --- 自我反思 ---

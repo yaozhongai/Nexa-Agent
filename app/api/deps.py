@@ -27,7 +27,7 @@ from app.api.schemas import (  # noqa: F401   — re-export for route convenienc
     StateMachineStatus,
 )
 from app.pipeline.extractor import ExtractionPipeline
-from app.pipeline.ollama_vlm import OllamaVLMEngine
+from app.pipeline.llamacpp_vlm import LlamaCppVLMEngine
 from app.llm.client import BaseLLMClient, create_llm_client
 from app.utils.logger_config import get_logger
 
@@ -49,7 +49,8 @@ def get_short_term_memory() -> ShortTermMemory:
     if _short_term_memory is None:
         config = get_config()
         _short_term_memory = ShortTermMemory(
-            max_turns=config.short_term_max_turns,
+            max_sessions=config.stm_max_sessions,
+            session_ttl_seconds=config.stm_session_ttl_seconds,
         )
         logger.info("短期记忆单例已初始化")
     return _short_term_memory
@@ -66,15 +67,15 @@ def get_long_term_memory() -> LongTermMemory:
 
 
 def get_extraction_pipeline() -> ExtractionPipeline:
-    """获取提取管线单例 — 自动注入 Ollama VLM 引擎"""
+    """获取提取管线单例 — 自动注入 llama.cpp VLM 引擎"""
     global _extraction_pipeline
     if _extraction_pipeline is None:
         config = get_config()
         _extraction_pipeline = ExtractionPipeline()
 
-        # 注入 VLM 引擎（llama.cpp / Ollama，MiniCPM-V 等）
+        # 注入 VLM 引擎（llama.cpp，MiniCPM-V 等）
         if config.vlm_enabled:
-            vlm = OllamaVLMEngine(
+            vlm = LlamaCppVLMEngine(
                 model=config.vlm_model_name,
                 base_url=config.vlm_base_url,
                 timeout=config.vlm_timeout,

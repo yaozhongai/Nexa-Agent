@@ -91,6 +91,7 @@ class TraceVisibility(str, Enum):
 
 class TraceNodeName(str, Enum):
     NORMALIZE_INPUT = "normalize_input"
+    LOAD_SHORT_TERM_CONTEXT = "load_short_term_context"
     ROUTE_TASK = "route_task"
     VISION_DIRECT = "vision_direct"
     VISION_SCHEMA = "vision_schema"

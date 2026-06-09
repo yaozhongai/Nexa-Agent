@@ -23,8 +23,9 @@ Nexa Agent V0 是一个 **LangGraph 原生、两层路由驱动、带完整 Trac
 - 上传后图片预识别缓存：`POST /api/v0/files/analyze` + `image_analysis_cache`
 - Cached Image QA：同会话追问复用 `active_file.vlm_text`，避免重复调用 VLM
 - 票据字段结构化提取：JSON 输出 + 基础校验
-- RAG 检索增强：短期记忆 + 长期记忆
-- Trace 可视化：Trace Events / Timeline / SSE
+- RAG 检索增强：STM（会话上下文，Turn 级别裁剪）+ LTM（历史票据/偏好）分层检索
+- STM 每轮对话始终写入，LTM 按 need_memory_write 门控
+- Trace 可视化：Trace Events / Timeline / SSE，STM 上下文摘要同步展示
 - Streamlit Chat UI：上传预览、会话上下文图片、Markdown 回答渲染
 
 ---
@@ -63,19 +64,23 @@ app/
 ├── llm/            DeepSeek V4 / Kimi K2.6 / GLM-5.1
 ├── pipeline/       llama.cpp VLM (MiniCPM-V) + 提取管线
 ├── api/            FastAPI (chat / upload / files/analyze / memory / trace)
-├── memory/         短期 LRU + 长期 SQLAlchemy
+├── memory/         短期记忆 STM Schema + 长期记忆 LTM
+│   ├── stm_schema.py   数据模型（枚举 + Pydantic）
+│   ├── short_term.py   STM Store（Session/Turn/Entry，Turn 级别裁剪）
+│   └── long_term.py    LTM Store（SQLAlchemy CRUD）
 └── utils/          路由规则 + 校验 + 日志
 ```
 
 ### 执行路径
 
-| 路径 | 场景 | LLM | VLM |
-|------|------|-----|-----|
-| VISION_DIRECT | 图片直答 (金额多少?) | 0 | 1 |
-| Cached Image QA | 已有 `active_file.vlm_text` 的图片追问 | 1 | 0 |
-| VISION_SCHEMA | 提取发票字段 | 0 | 1 |
-| RAG_QA | 文本问答 + 复杂推理 | 1-2 | 0-1 |
-| TOOL_ACT | 工具执行 (V1 预留) | — | — |
+| 路径 | 场景 | LLM | VLM | STM |
+|------|------|-----|-----|-----|
+| VISION_DIRECT | 图片直答 (金额多少?) | 0 | 1 | ✅ |
+| Cached Image QA | 已有 `vlm_text` 的图片追问 | 1 | 0 | ✅ |
+| VISION_SCHEMA | 提取发票字段 | 0 | 1 | ✅ |
+| RAG_QA | 文本问答 + 复杂推理 | 1-2 | 0-1 | ✅ |
+| TOOL_ACT | 工具执行 (V1 预留) | — | — | — |
+> STM 每轮始终写入，LTM 仅 VISION_SCHEMA 写入票据
 
 ### API
 
@@ -125,4 +130,5 @@ app/
 | [TECHNICAL_ARCHITECTURE.md](docs/TECHNICAL_ARCHITECTURE.md) | 技术架构 |
 | [AgentState_SchemaV2.md](docs/AgentState_SchemaV2.md) | 状态协议 |
 | [AgentTrace_Schema.md](docs/AgentTrace_Schema.md) | Trace 协议 |
+| [Short-Term_Memory_Schema.md](docs/Short-Term_Memory_Schema.md) | 短期记忆协议 |
 | [SPEC.md](SPEC.md) | 项目规范与当前实现约束 |

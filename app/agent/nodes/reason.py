@@ -34,7 +34,13 @@ def reason(state: AgentState) -> dict:
     system = "你是 Nexa Agent，智能助手。根据上下文和用户问题直接回答。"
     messages = [LLMMessage.system(system)]
     for m in state.get("short_term_context", []):
-        messages.append(LLMMessage(role=m.get("role", "user"), content=m.get("content", "")))
+        role = _map_to_llm_role(m.get("role", "user"))
+        content = m.get("content", "")
+        entry_type = m.get("entry_type", "")
+        # 非对话条目转为 system 上下文
+        if role == "system" and entry_type not in ("user_message", "assistant_message", "final_answer"):
+            content = f"[{entry_type}] {content}"
+        messages.append(LLMMessage(role=role, content=content))
     if vlm_text:
         messages.append(LLMMessage.system(f"【图片识别内容】\n{vlm_text}"))
     messages.append(LLMMessage.user(state.get("user_input", "")))
@@ -80,3 +86,11 @@ def reason(state: AgentState) -> dict:
                       latency_ms=elapsed, confidence=0.8),
         "step_count": step,
     }
+
+
+def _map_to_llm_role(stm_role: str) -> str:
+    """STM entry role → LLM API 合法 role"""
+    if stm_role in ("user", "assistant", "system"):
+        return stm_role
+    # observer / tool → 映射为 user（作为上下文参考）
+    return "user"

@@ -1,8 +1,8 @@
 """
 VLM 客户端 — V0
 
-支持通过 llama.cpp / Ollama 部署视觉语言模型（MiniCPM-V 等），
-使用 OpenAI 兼容 API 调用，支持多模态图片输入。
+通过 llama.cpp server 的 OpenAI 兼容 API 调用视觉语言模型（MiniCPM-V 等），
+支持多模态图片输入。
 
 实现 BaseVLMEngine 接口，可直接注入 ExtractionPipeline。
 
@@ -21,12 +21,12 @@ from app.utils.logger_config import get_logger
 logger = get_logger("vlm_engine")
 
 
-class OllamaVLMEngine(BaseVLMEngine):
-    """VLM 引擎 — 通过 OpenAI 兼容 API 调用 (llama.cpp / Ollama)
+class LlamaCppVLMEngine(BaseVLMEngine):
+    """VLM 引擎 — 通过 llama.cpp OpenAI 兼容 API 调用
 
     用法::
 
-        engine = OllamaVLMEngine(model="minicpm-v", base_url="http://127.0.0.1:8080/v1")
+        engine = LlamaCppVLMEngine(model="minicpm-v", base_url="http://127.0.0.1:8080/v1")
         engine.is_available()  # → True/False
         result = engine.analyze_image("invoice.jpg", prompt="提取发票信息")
 
@@ -48,7 +48,7 @@ class OllamaVLMEngine(BaseVLMEngine):
         self._timeout = timeout
         self._ctx_size = ctx_size
         self._client = None
-        logger.info("VLM 引擎初始化 model=%s base_url=%s ctx=%d", model, base_url, ctx_size)
+        logger.info("llama.cpp VLM 引擎初始化 model=%s base_url=%s ctx=%d", model, base_url, ctx_size)
 
     # ------------------------------------------------------------------
     # 核心方法
@@ -116,17 +116,17 @@ class OllamaVLMEngine(BaseVLMEngine):
             )
 
             logger.info(
-                "Ollama VLM 完成 model=%s elapsed=%.0fms tokens(in=%d out=%d)",
+                "llama.cpp VLM 完成 model=%s elapsed=%.0fms tokens(in=%d out=%d)",
                 self._model, elapsed, result.prompt_tokens, result.completion_tokens,
             )
             return result
 
         except Exception as exc:
-            logger.error("Ollama VLM 调用失败: %s", exc, exc_info=True)
+            logger.error("llama.cpp VLM 调用失败: %s", exc, exc_info=True)
             raise
 
     def is_available(self) -> bool:
-        """检查 Ollama 服务是否可用"""
+        """检查 llama.cpp 服务是否可用"""
         try:
             import urllib.request
             req = urllib.request.Request(f"{self._base_url}/models")
