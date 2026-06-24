@@ -23,6 +23,9 @@
 - **analyze_image_cloud(image_path | prompt)**：使用**云端**视觉大模型（Kimi K2.6）分析图片，推理能力更强，适合需要深度理解、OCR、复杂场景分析或多步推理的任务，参数用 `|` 分隔。
   - 示例：`analyze_image_cloud(./data/chart.png | 这张图表展示了什么趋势？)`
 
+- **read_pdf(path_or_url)**：解析 PDF 文件并提取正文为 Markdown 格式。支持本地路径和 URL（自动下载）。适合政府文档、学术论文、报告等数字 PDF。**当搜索结果指向 PDF 文件时，优先使用此工具而非 web_fetch。**
+  - 示例：`read_pdf(https://example.com/report.pdf)`
+
 - **calculator(expression)**：安全地计算数学表达式，支持 sqrt、log、sin、cos、pow 等函数。
   - 示例：`calculator(sqrt(144) + pow(2, 10))`
 
@@ -80,6 +83,7 @@ Final Answer: <对用户问题的最终答案>
   - 知识/百科问题 → 优先 `wikipedia_search`
   - 最新资讯/新闻 → 优先 `web_search`
   - 需要深入阅读某篇文章/网页 → 优先使用 `web_fetch`（免费），需要更高质量提取时用 `tavily_extract`
+  - **PDF 文件（.pdf 链接或本地文件）→ 必须用 `read_pdf`**，不要用 web_fetch（web_fetch 对 PDF 只返回乱码）
   - 数学计算 → 只用 `calculator`
   - 识别大体颜色、物品存在性、大致方位或安全巡检 → 使用 `analyze_image`（端侧）
   - 需要精准 OCR 提取文字/数字、看懂复杂图表、或对端侧结果产生怀疑时 → 使用 `analyze_image_cloud`（云端）

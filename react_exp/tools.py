@@ -64,6 +64,54 @@ def register(name: str, description: str, signature: str, examples: List[str]):
     return decorator
 
 
+def get_openai_tool_definitions() -> List[Dict[str, Any]]:
+    """生成 OpenAI function calling 格式的工具定义列表"""
+    definitions = []
+    for name, meta in TOOL_META.items():
+        desc = meta["description"]
+        if meta.get("examples"):
+            desc += "\n示例: " + "; ".join(meta["examples"])
+
+        # 所有工具都接受单个字符串参数（保持与现有接口兼容）
+        tool_def = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": _get_param_description(name, meta),
+                        }
+                    },
+                    "required": ["input"] if name != "get_current_time" else [],
+                },
+            },
+        }
+        definitions.append(tool_def)
+    return definitions
+
+
+def _get_param_description(name: str, meta: dict) -> str:
+    """根据工具名生成参数描述"""
+    sig = meta.get("signature", "")
+    param_map = {
+        "web_search": "搜索关键词",
+        "wikipedia_search": "搜索关键词",
+        "web_fetch": "要抓取的网页 URL",
+        "tavily_extract": "要提取内容的网页 URL",
+        "save_content": "保存文件名（不含扩展名）",
+        "analyze_image": "图片路径 | 分析提示词（用 | 分隔）",
+        "analyze_image_cloud": "图片路径 | 分析提示词（用 | 分隔）",
+        "calculator": "数学表达式，支持 sqrt/sin/cos/log/pi 等",
+        "get_current_time": "无需参数",
+        "read_pdf": "PDF 路径或 URL。大文档可指定页码: path | pages=3-5",
+    }
+    return param_map.get(name, f"参数，格式参考: {sig}")
+
+
 # ==========================================================================
 # 工具实现
 # ==========================================================================
@@ -828,17 +876,44 @@ def calculator(expression: str) -> str:
     Returns:
         计算结果
     """
+    import math as _math
+
     expression = expression.strip()
     if not expression:
         return "[错误] calculator: 表达式不能为空"
 
+    # 预处理: LLM 常用 ^ 表示幂运算，Python 里需要 **
+    expression = expression.replace("^", "**")
+    # 预处理: 去掉多语句（numexpr 不支持分号分隔）
+    if ";" in expression:
+        parts = [p.strip() for p in expression.split(";") if p.strip()]
+        expression = parts[-1] if parts else expression
+
     logger.info("calculator 调用 expression=%s", expression)
+
+    # 安全的数学函数和常量（eval 和 numexpr 共用）
+    _safe_dict = {
+        "sqrt": _math.sqrt,
+        "log": _math.log,
+        "log10": _math.log10,
+        "log2": _math.log2,
+        "sin": _math.sin,
+        "cos": _math.cos,
+        "tan": _math.tan,
+        "asin": _math.asin,
+        "acos": _math.acos,
+        "atan": _math.atan,
+        "atan2": _math.atan2,
+        "pow": pow,
+        "abs": abs,
+        "pi": _math.pi,
+        "e": _math.e,
+    }
 
     try:
         import numexpr
 
-        result = numexpr.evaluate(expression)
-        # numexpr 返回 numpy 标量，转为 Python 原生类型
+        result = numexpr.evaluate(expression, local_dict=_safe_dict)
         if hasattr(result, "item"):
             result = result.item()
 
@@ -846,39 +921,18 @@ def calculator(expression: str) -> str:
         return f"计算结果: {expression} = {result}"
 
     except ImportError:
-        logger.error("calculator: numexpr 未安装")
-        return "[错误] calculator: numexpr 库未安装，请执行 pip install numexpr"
-    except SyntaxError as exc:
-        logger.error("calculator 语法错误: %s", exc)
-        return f"[错误] calculator: 表达式语法错误 - {exc}"
+        pass
     except Exception as exc:
-        logger.error("calculator 执行失败: %s", exc, exc_info=True)
+        logger.debug("calculator numexpr 失败，降级到 eval: %s", exc)
 
-        # 回退到 Python eval（仅用于安全的数学表达式）
-        try:
-            # 只允许安全的数学函数和常量
-            safe_dict = {
-                "sqrt": __import__("math").sqrt,
-                "log": __import__("math").log,
-                "log10": __import__("math").log10,
-                "log2": __import__("math").log2,
-                "sin": __import__("math").sin,
-                "cos": __import__("math").cos,
-                "tan": __import__("math").tan,
-                "asin": __import__("math").asin,
-                "acos": __import__("math").acos,
-                "atan": __import__("math").atan,
-                "pow": pow,
-                "abs": abs,
-                "pi": 3.141592653589793,
-                "e": 2.718281828459045,
-            }
-            result = eval(expression, {"__builtins__": {}}, safe_dict)
-            logger.info("calculator (eval fallback) 结果=%s", result)
-            return f"计算结果: {expression} = {result}"
-        except Exception as e2:
-            logger.error("calculator eval fallback 也失败: %s", e2)
-            return f"[错误] calculator: 计算失败 - numexpr: {exc}, eval: {e2}"
+    # eval fallback
+    try:
+        result = eval(expression, {"__builtins__": {}}, _safe_dict)
+        logger.info("calculator 结果=%s", result)
+        return f"计算结果: {expression} = {result}"
+    except Exception as e2:
+        logger.error("calculator 计算失败: %s", e2)
+        return f"[错误] calculator: 计算失败 - {e2}"
 
 
 # --------------------------------------------------------------------------
@@ -906,6 +960,118 @@ def get_current_time(_param: str = "") -> str:
     weekday = weekday_map[now.weekday()]
     result = now.strftime(f"当前时间: %Y年%m月%d日 {weekday} %H:%M:%S")
     return result
+
+
+# --------------------------------------------------------------------------
+# PDF 解析
+# --------------------------------------------------------------------------
+
+@register(
+    name="read_pdf",
+    description="解析 PDF 文件并提取正文为 Markdown 格式。支持本地路径和 URL（自动下载）。"
+                "适合政府文档、学术论文、报告等数字 PDF。"
+                "对于大文档，可指定页码范围：read_pdf(path_or_url | pages=3-5)",
+    signature="read_pdf(path_or_url | pages=start-end)",
+    examples=[
+        "read_pdf(https://example.com/report.pdf)",
+        "read_pdf(data/document.pdf | pages=1-5)",
+    ],
+)
+def read_pdf(param: str) -> str:
+    """解析 PDF 并提取 Markdown 文本
+
+    支持:
+    - 本地文件路径或 URL
+    - 可选分页: path_or_url | pages=3-5
+
+    策略：小文档全量返回，大文档返回目录概要+指引 Agent 分页精读。
+    """
+    param = param.strip()
+    if not param:
+        return "[错误] read_pdf: 参数不能为空，请提供 PDF 路径或 URL"
+
+    # 解析可选的 pages 参数
+    page_start, page_end = None, None
+    source = param
+    if "|" in param:
+        parts = param.split("|", 1)
+        source = parts[0].strip()
+        extra = parts[1].strip()
+        import re as _re
+        pages_match = _re.search(r"pages?\s*=\s*(\d+)(?:\s*-\s*(\d+))?", extra, _re.IGNORECASE)
+        if pages_match:
+            page_start = int(pages_match.group(1))
+            page_end = int(pages_match.group(2)) if pages_match.group(2) else page_start
+
+    logger.info("read_pdf 调用 source=%s pages=%s-%s", source[:150], page_start, page_end)
+
+    import tempfile
+
+    tmp_path = None
+    pdf_path = None
+
+    try:
+        if source.startswith("http://") or source.startswith("https://"):
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            }
+            resp = requests.get(source, timeout=60, headers=headers)
+            if resp.status_code != 200:
+                return f"[错误] read_pdf: 下载失败 HTTP {resp.status_code} — {source[:100]}"
+            if len(resp.content) < 100:
+                return f"[错误] read_pdf: 下载内容太小 ({len(resp.content)} bytes)"
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            tmp.write(resp.content)
+            tmp.close()
+            tmp_path = tmp.name
+            pdf_path = tmp_path
+            logger.info("read_pdf 已下载 %d bytes → %s", len(resp.content), tmp_path)
+        else:
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for c in [source, os.path.join(_root, source), os.path.join(_root, "data", source)]:
+                if os.path.isfile(c):
+                    pdf_path = c
+                    break
+            if not pdf_path:
+                return f"[错误] read_pdf: 文件不存在 — {source}"
+
+        import pymupdf4llm
+        import pymupdf
+
+        doc = pymupdf.open(pdf_path)
+        total_pages = len(doc)
+        doc.close()
+
+        # 分页提取
+        kwargs = {}
+        if page_start is not None:
+            pages_list = list(range(page_start - 1, min(page_end or page_start, total_pages)))
+            kwargs["pages"] = pages_list
+
+        md_text = pymupdf4llm.to_markdown(pdf_path, **kwargs)
+
+        if not md_text or len(md_text.strip()) < 20:
+            return f"[错误] read_pdf: PDF 提取结果为空或过短，可能是扫描件或加密文件"
+
+        logger.info("read_pdf 提取完成 total_pages=%d chars=%d", total_pages, len(md_text))
+
+        _session_extracts.append({
+            "url": source,
+            "title": os.path.basename(source)[:80],
+            "raw_content": md_text,
+        })
+
+        page_info = f"第 {page_start}-{page_end} 页" if page_start else "全文"
+        return f"PDF 解析成功 (共 {total_pages} 页, {page_info}, {len(md_text)} 字符):\n\n{md_text}"
+
+    except Exception as exc:
+        logger.error("read_pdf 失败: %s", exc, exc_info=True)
+        return f"[错误] read_pdf: 解析失败 — {exc}"
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 # ==========================================================================

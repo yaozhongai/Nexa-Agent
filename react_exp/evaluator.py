@@ -152,9 +152,63 @@ def _detect_uncertainty(answer: str) -> Optional[dict]:
     return None
 
 
+def _detect_tool_gap(trajectory: str) -> Optional[dict]:
+    """检测工具能力缺口：Agent 反复尝试读取同一资源但无法获取有效内容
+
+    典型场景：PDF 链接用 web_fetch/tavily_extract 反复读取但拿到乱码。
+    判定条件：同一 URL 被 ≥2 种不同工具访问过，且都未产生有效结果。
+    """
+    # 提取所有 URL 参数（从 Action 和 tool call 中）
+    url_pattern = r"https?://[^\s\)\]\},\"'<>]+"
+    urls_in_actions = re.findall(url_pattern, trajectory)
+    if not urls_in_actions:
+        return None
+
+    # 统计每个 URL 被访问的次数
+    url_counter = Counter()
+    for url in urls_in_actions:
+        # 归一化：去掉 query string 和 fragment
+        base_url = url.split("?")[0].split("#")[0].rstrip("/")
+        url_counter[base_url] += 1
+
+    # 找出被访问 ≥3 次的 URL
+    repeated_urls = {url: cnt for url, cnt in url_counter.items() if cnt >= 3}
+    if not repeated_urls:
+        return None
+
+    # 检查这些 URL 是否是 PDF（.pdf 后缀）
+    pdf_urls = [u for u in repeated_urls if u.lower().endswith(".pdf")]
+
+    # 检查答案中是否包含"无法"相关表述
+    inability_markers = ["无法", "不支持", "cannot", "unable", "乱码", "无效"]
+    traj_lower = trajectory.lower()
+    has_inability = any(m in traj_lower for m in inability_markers)
+
+    if pdf_urls:
+        top_url = max(pdf_urls, key=lambda u: repeated_urls[u])
+        return {
+            "failure_mode": "tool_gap",
+            "reason": f"PDF '{top_url[-60:]}' 被访问 {repeated_urls[top_url]} 次但未获取有效内容"
+                      f"（可能需要 read_pdf 工具）",
+            "severity": "high",
+        }
+
+    if has_inability and repeated_urls:
+        top_url = max(repeated_urls, key=lambda u: repeated_urls[u])
+        return {
+            "failure_mode": "tool_gap",
+            "reason": f"URL '{top_url[-60:]}' 被访问 {repeated_urls[top_url]} 次，"
+                      f"Agent 可能缺少处理该资源类型的工具",
+            "severity": "medium",
+        }
+
+    return None
+
+
 # 启发式规则列表（按优先级排序）
 HEURISTIC_RULES = [
     ("context_overflow", _detect_context_overflow),
+    ("tool_gap", _detect_tool_gap),
     ("loop", _detect_repeated_actions),
     ("tool_misuse", _detect_tool_errors),
     ("wrong_reasoning", _detect_uncertainty),
@@ -358,37 +412,88 @@ class Evaluator:
 
     # ── 混合评估 ──
 
+    def _has_substantive_answer(self, answer: str, terminated_reason: str) -> bool:
+        """判断 Agent 是否给出了实质性答案（而非错误消息或空答案）"""
+        if terminated_reason in ("llm_error", "parse_error"):
+            return False
+        if not answer or len(answer.strip()) < 15:
+            return False
+        if answer.startswith("[错误]"):
+            return False
+        return True
+
     def _hybrid_evaluate(
         self, task: str, answer: str, trajectory: str, terminated_reason: str,
     ) -> EvalResult:
-        """先跑启发式 → 高严重度失败直接返回 → 低严重度/通过走 LLM 确认"""
+        """结果优先的混合评估
+
+        核心原则：过程问题是 warning，不是 veto。只有结果问题才能否决。
+        - 有实质性答案 → 先 LLM 评估答案质量，过程问题只降置信度
+        - 无答案/错误终止 → 走启发式流程诊断失败原因
+        """
         heuristic = self._heuristic_evaluate(trajectory, answer, terminated_reason)
 
+        # ── 结果优先：有实质性答案时，先评估答案质量 ──
+        if self._has_substantive_answer(answer, terminated_reason):
+            logger.info("Hybrid: 检测到实质性答案 (len=%d)，启动 LLM 答案质量评估...", len(answer))
+            llm = self._llm_evaluate(task, answer, trajectory)
+
+            if llm.success:
+                # 答案通过：过程问题记为 warning 但不否决
+                confidence = llm.confidence
+                reason = llm.reason
+                if not heuristic.success:
+                    confidence *= 0.85  # 过程有问题则降低置信度
+                    reason = f"答案质量通过（过程存在 {heuristic.failure_mode} 问题）: {llm.reason}"
+                    logger.info("Hybrid: 答案通过，过程有 %s，置信度降为 %.2f",
+                                heuristic.failure_mode, confidence)
+                else:
+                    reason = f"启发式 + LLM 双重确认通过: {llm.reason}"
+
+                return EvalResult(
+                    success=True,
+                    confidence=confidence,
+                    reason=reason,
+                    heuristic_result=heuristic.__dict__ if hasattr(heuristic, '__dict__') else None,
+                    llm_result=llm.llm_result,
+                )
+            else:
+                # LLM 认为答案质量不行 → 结合过程诊断返回失败
+                failure_mode = llm.failure_mode or heuristic.failure_mode or "wrong_reasoning"
+                return EvalResult(
+                    success=False,
+                    confidence=llm.confidence,
+                    reason=f"LLM 判定答案质量不足: {llm.reason}",
+                    feedback_signal=llm.feedback_signal,
+                    failure_mode=failure_mode,
+                    heuristic_result=heuristic.__dict__ if hasattr(heuristic, '__dict__') else None,
+                    llm_result=llm.llm_result,
+                )
+
+        # ── 无实质性答案：走启发式诊断 ──
         if not heuristic.success:
-            # 高严重度失败（loop / tool_misuse / context_overflow）→ 直接返回，不浪费 LLM 调用
-            high_severity_modes = {"loop", "tool_misuse", "context_overflow"}
+            # 高严重度 → 直接返回（没有答案可评估，无需 LLM）
+            high_severity_modes = {"loop", "tool_misuse", "context_overflow", "tool_gap"}
             if heuristic.failure_mode in high_severity_modes:
-                logger.info("Hybrid: 启发式判定失败 (%s, high)，跳过 LLM", heuristic.failure_mode)
+                logger.info("Hybrid: 无实质答案 + 启发式失败 (%s)，直接返回", heuristic.failure_mode)
                 return heuristic
 
-            # 低严重度失败（premature_answer / wrong_reasoning）→ LLM 复审
-            logger.info("Hybrid: 启发式判定失败 (%s, low)，启动 LLM 复审...", heuristic.failure_mode)
+            # 低严重度 → LLM 复审
+            logger.info("Hybrid: 无实质答案 + 启发式低严重度 (%s)，LLM 复审...", heuristic.failure_mode)
             llm = self._llm_evaluate(task, answer, trajectory)
             if llm.success:
                 return EvalResult(
                     success=True,
-                    confidence=llm.confidence,
+                    confidence=llm.confidence * 0.8,
                     reason=f"启发式存疑但 LLM 复审通过: {llm.reason}",
                     heuristic_result={"heuristic_failed": heuristic.failure_mode},
                     llm_result=llm.llm_result,
                 )
             return llm
 
-        # 启发式通过，用 LLM 二次确认
+        # 启发式通过但无实质答案 → LLM 二次确认
         logger.info("Hybrid: 启发式通过，启动 LLM 二次确认...")
         llm = self._llm_evaluate(task, answer, trajectory)
-
-        # 如果 LLM 也通过，成功
         if llm.success:
             return EvalResult(
                 success=True,
@@ -397,8 +502,6 @@ class Evaluator:
                 heuristic_result=heuristic.__dict__ if hasattr(heuristic, '__dict__') else None,
                 llm_result=llm.llm_result,
             )
-
-        # LLM 认为失败，以 LLM 为准
         return EvalResult(
             success=False,
             confidence=llm.confidence,

@@ -43,7 +43,7 @@ try:
 except ImportError:
     pass
 
-from react_exp.logger_config import get_logger
+from react_exp.logger_config import get_logger, start_run_log, stop_run_log
 from react_exp.react_agent import react_loop, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
 from react_exp.memory import ReflexionMemory, ReflectionEntry, _jaccard_similarity
 from react_exp.evaluator import Evaluator, EvalResult, create_evaluator
@@ -190,6 +190,11 @@ class ReflexionReActAgent:
         Returns:
             ReflexionResult
         """
+        # 每次运行开启独立日志文件
+        run_log_path = start_run_log(tag="reflexion")
+        logger.info("Run log: %s", run_log_path)
+        logger.info("Task: %s", task[:200])
+
         if verbose:
             print(f"\n{'='*60}")
             print(f"🔄 ReflexionReActAgent 启动")
@@ -198,9 +203,19 @@ class ReflexionReActAgent:
             print(f"📏 每次最大步数: {self.max_steps}")
             print(f"🧠 记忆池容量: {self.memory.max_size}")
             print(f"🔍 评估模式: {self.evaluator.mode}")
+            print(f"📄 日志: {run_log_path}")
             print(f"{'='*60}\n")
 
         trial_details = []
+
+        # 每次新任务清空教训计数器，防止跨任务污染
+        self.lesson_counter.clear()
+
+        # 跨 Trial 的已访问 URL 追踪
+        visited_urls: set[str] = set()
+
+        # 跨 Trial 的事实草稿板（Scratchpad）
+        scratchpad_facts: list[str] = []
 
         for trial in range(1, self.max_trials + 1):
             t0 = time.time()
@@ -211,8 +226,28 @@ class ReflexionReActAgent:
                 print(f"🔄 Trial {trial}/{self.max_trials} {memory_state}")
                 print(f"{'─'*40}")
 
-            # 阶段 1: 检索长期记忆
+            # 阶段 1: 检索长期记忆 + Scratchpad 事实 + 已访问 URL 约束
             memories = self.memory.get_memories_for_prompt()
+
+            # 注入 scratchpad 事实（最高优先级，放在最前面）
+            if scratchpad_facts:
+                facts_block = (
+                    "以下是之前 Trial 已确认的事实数据，无需重新搜索，直接使用：\n"
+                    + "\n".join(f"- {f}" for f in scratchpad_facts)
+                )
+                memories = [facts_block] + (memories or [])
+                if verbose:
+                    print(f"📋 Scratchpad: 注入 {len(scratchpad_facts)} 条已确认事实")
+
+            if visited_urls:
+                url_constraint = (
+                    "下次不要再访问以下 URL（之前的 Trial 已访问过，内容无用或无法解析）: "
+                    + ", ".join(sorted(visited_urls)[:5])
+                )
+                memories = (memories or []) + [url_constraint]
+                if verbose:
+                    print(f"🚫 排除 {len(visited_urls)} 个已访问 URL")
+
             if memories and verbose:
                 print(f"🧠 注入 {len(memories)} 条历史教训:")
                 for i, m in enumerate(memories, 1):
@@ -227,11 +262,35 @@ class ReflexionReActAgent:
                 long_term_memory=memories if memories else None,
             )
 
+            # 从轨迹中提取本轮访问过的 URL，累积到 visited_urls
+            self._extract_visited_urls(react_result.get("trajectory", ""), visited_urls)
+
             answer = react_result["answer"]
             trajectory = react_result["trajectory"]
             steps_used = react_result["steps_used"]
             terminated_reason = react_result["terminated_reason"]
             trial_elapsed = time.time() - t0
+
+            # 快速失败: API 余额不足/认证失败等不可恢复错误，直接终止所有 Trial
+            if terminated_reason == "llm_error" and any(
+                code in answer for code in ["402", "401", "Insufficient Balance", "Authentication"]
+            ):
+                logger.error("不可恢复的 API 错误，跳过剩余 Trial: %s", answer[:100])
+                if verbose:
+                    print(f"\n🛑 API 不可恢复错误，终止重试: {answer[:100]}")
+                stop_run_log()
+                return ReflexionResult(
+                    success=False,
+                    answer=answer,
+                    trials_used=trial,
+                    trial_details=[{
+                        "trial": trial, "success": False, "answer": answer,
+                        "steps_used": steps_used, "terminated_reason": terminated_reason,
+                        "failure_mode": "api_error", "eval_reason": answer[:200],
+                        "elapsed_seconds": round(trial_elapsed, 1), "reflection": None,
+                    }],
+                    reflections=[],
+                )
 
             # 阶段 3: 评估
             eval_result = self.evaluator.evaluate(
@@ -287,6 +346,7 @@ class ReflexionReActAgent:
                         print(f"\n✅ Trial {trial} 成功! (置信度: {eval_result.confidence:.0%})")
                     logger.info("Reflexion 成功 trial=%d confidence=%.2f elapsed=%.1fs",
                                 trial, eval_result.confidence, trial_elapsed)
+                    stop_run_log()
                     return ReflexionResult(
                         success=True,
                         answer=answer,
@@ -349,6 +409,16 @@ class ReflexionReActAgent:
             if verbose:
                 print(f"🧠 记忆已更新: {self.memory.size()}/{self.memory.max_size} 条")
 
+            # 阶段 6: 从轨迹中提取已确认的事实到 Scratchpad
+            new_facts = self._extract_scratchpad_facts(task, answer, trajectory)
+            if new_facts:
+                for fact in new_facts:
+                    if fact not in scratchpad_facts:
+                        scratchpad_facts.append(fact)
+                if verbose:
+                    print(f"📋 Scratchpad 更新: +{len(new_facts)} 条事实 (共 {len(scratchpad_facts)} 条)")
+                logger.info("Scratchpad 更新: +%d facts, total=%d", len(new_facts), len(scratchpad_facts))
+
         # 所有 Trial 用尽
         last_answer = trial_details[-1]["answer"] if trial_details else ""
         logger.warning("Reflexion 所有 %d 轮 Trial 均失败", self.max_trials)
@@ -359,6 +429,7 @@ class ReflexionReActAgent:
             print(f"   最后答案: {last_answer[:200]}")
             print(f"{'='*60}")
 
+        stop_run_log()
         return ReflexionResult(
             success=False,
             answer=last_answer,
@@ -571,6 +642,94 @@ class ReflexionReActAgent:
         key = re.sub(r"[^\w一-鿿]", "", lesson.lower())
         return key[:30]
 
+    def _extract_scratchpad_facts(
+        self, task: str, answer: str, trajectory: str,
+    ) -> list[str]:
+        """从本轮 Trial 轨迹中提取已确认的关键事实数据
+
+        不是教训/策略，是具体的数据点（数值、名称、日期等），
+        下一轮 Trial 可以直接使用而无需重新搜索。
+        """
+        from openai import OpenAI
+
+        # 只在有实质性答案或较长轨迹时提取（避免对空轨迹浪费 API）
+        if len(trajectory) < 500 and len(answer) < 50:
+            return []
+
+        traj_tail = trajectory[-3000:] if len(trajectory) > 3000 else trajectory
+        answer_snippet = answer[:500]
+
+        prompt = f"""从以下 Agent 执行轨迹中提取已确认的关键事实数据。
+
+要求：
+- 只提取具体的数据点（数值、名称、日期、URL 等），不要提取策略建议
+- 每条事实必须是已从工具返回中确认的，不是 Agent 猜测的
+- 每条不超过 80 字
+- 最多提取 5 条最重要的事实
+- 如果没有确认的事实，输出"无"
+
+任务: {task[:200]}
+
+Agent 最终答案: {answer_snippet}
+
+轨迹末尾:
+{traj_tail}
+
+请只输出事实列表，每条一行："""
+
+        try:
+            client = OpenAI(
+                api_key=LLM_API_KEY,
+                base_url=LLM_BASE_URL,
+                timeout=60.0,
+            )
+            model = get_model_for_role("lesson_extract")
+            kwargs = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "你是一个数据提取专家。只输出从工具返回中确认的事实数据，每条一行。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 300,
+                "temperature": 0.0,
+                "stream": False,
+            }
+            if "deepseek" in model.lower():
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
+            response = client.chat.completions.create(**kwargs)
+            content = response.choices[0].message.content or ""
+
+            if "无" in content and len(content) < 20:
+                return []
+
+            facts = []
+            for line in content.strip().split("\n"):
+                line = line.strip().lstrip("0123456789.-、) ")
+                if len(line) >= 10 and len(line) <= 120:
+                    facts.append(line)
+
+            logger.info("Scratchpad 事实提取完成: %d 条", len(facts))
+            return facts[:5]
+
+        except Exception as exc:
+            logger.error("Scratchpad 事实提取失败: %s", exc)
+            return []
+
+    @staticmethod
+    def _extract_visited_urls(trajectory: str, visited_urls: set) -> None:
+        """从轨迹中提取已访问的 URL，用于跨 Trial 去重"""
+        import re as _re
+        fetch_tools = {"web_fetch", "tavily_extract", "read_pdf"}
+        # 匹配 tool calling 格式和传统 Action 格式中的 URL
+        urls = _re.findall(r"https?://[^\s\)\]\},\"'<>]+", trajectory)
+        for url in urls:
+            base = url.split("?")[0].rstrip("/")
+            if base.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx")):
+                visited_urls.add(base)
+            elif any(tool in trajectory[:trajectory.find(url) + 1] for tool in fetch_tools if url in trajectory):
+                visited_urls.add(base)
+
     @staticmethod
     def _sandwich_truncate(text: str, head_chars: int = 1000, tail_chars: int = 1940) -> str:
         """三明治截断：保留首尾，中间省略
@@ -639,7 +798,15 @@ def main():
     parser.add_argument(
         "task",
         type=str,
-        help="用户任务描述",
+        nargs="?",
+        default=None,
+        help="用户任务描述（直接输入文本，或用 --file 从文件读取）",
+    )
+    parser.add_argument(
+        "--file", "-f",
+        type=str,
+        default=None,
+        help="从 TXT 文件读取问题（# 开头的行为注释）",
     )
     parser.add_argument(
         "--image", "-i",
@@ -695,6 +862,30 @@ def main():
         print(get_config_summary())
         return
 
+    # 确定任务文本: --file 优先，其次 positional arg
+    task_text = None
+    if args.file:
+        fpath = Path(args.file)
+        if not fpath.exists():
+            alt = Path(_project_root) / args.file
+            fpath = alt if alt.exists() else fpath
+        if not fpath.exists():
+            print(f"❌ 文件不存在: {args.file}")
+            sys.exit(1)
+        with open(fpath, "r", encoding="utf-8") as f:
+            lines = [l.rstrip() for l in f if not l.lstrip().startswith("#")]
+        task_text = "\n".join(lines).strip()
+        if not task_text:
+            print(f"❌ 文件中没有有效内容: {fpath}")
+            sys.exit(1)
+        print(f"📄 从 {fpath} 加载问题 ({len(task_text)} 字符)")
+    elif args.task:
+        task_text = args.task
+    else:
+        print("❌ 请提供任务文本或使用 --file 指定问题文件")
+        parser.print_help()
+        sys.exit(1)
+
     # 验证 API Key
     if not LLM_API_KEY:
         print("❌ 错误: 未配置 DEEPSEEK_API_KEY 或 KIMI_API_KEY")
@@ -728,7 +919,7 @@ def main():
 
     # 执行
     result = agent.execute(
-        task=args.task,
+        task=task_text,
         image_path=image_path,
         verbose=not args.quiet,
     )

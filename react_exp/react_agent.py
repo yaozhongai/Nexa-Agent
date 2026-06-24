@@ -54,6 +54,7 @@ from react_exp.logger_config import get_logger
 from react_exp.tools import (
     execute_tool, TOOLS,
     get_session_extracts, clear_session_extracts, write_extract_to_disk,
+    get_openai_tool_definitions,
 )
 from react_exp.config import get_model_for_role, DYNAMIC_UPGRADE_THRESHOLD
 
@@ -146,14 +147,9 @@ def call_llm(
     enable_thinking: bool = True,
     max_tokens: int = 4096,
     model: Optional[str] = None,
+    tools: Optional[List[dict]] = None,
 ) -> Tuple[str, int, int]:
-    """调用 DeepSeek LLM
-
-    Args:
-        messages: 对话消息列表
-        enable_thinking: 是否启用 DeepSeek 推理模式
-        max_tokens: 最大输出 token 数
-        model: 可选模型名覆盖，为 None 则使用全局 LLM_MODEL
+    """调用 DeepSeek LLM（兜底汇总等非 tool calling 场景）
 
     Returns:
         (response_text, prompt_tokens, completion_tokens)
@@ -161,16 +157,18 @@ def call_llm(
     client = _get_llm_client()
     actual_model = model or LLM_MODEL
 
-    # 构建 API 参数
     kwargs = {
         "model": actual_model,
         "messages": messages,
         "max_tokens": max_tokens,
         "stream": False,
-        "stop": ["Observation:"],  # 防止模型自行捏造 Observation
     }
 
-    # DeepSeek thinking 模式控制（仅 Pro 模型支持 thinking）
+    if tools:
+        kwargs["tools"] = tools
+    else:
+        kwargs["stop"] = ["Observation:"]
+
     if enable_thinking and "pro" in actual_model.lower():
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
     elif "deepseek" in actual_model.lower():
@@ -194,6 +192,56 @@ def call_llm(
     )
 
     return content, prompt_tokens, completion_tokens
+
+
+def call_llm_with_tools(
+    messages: List[dict],
+    tools: List[dict],
+    enable_thinking: bool = False,
+    max_tokens: int = 4096,
+    model: Optional[str] = None,
+):
+    """调用 DeepSeek LLM 并返回完整 choice（支持 tool_calls）
+
+    Returns:
+        (choice, prompt_tokens, completion_tokens)
+        choice.message 可能含 .tool_calls 或 .content
+    """
+    client = _get_llm_client()
+    actual_model = model or LLM_MODEL
+
+    kwargs = {
+        "model": actual_model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "tools": tools,
+    }
+
+    if enable_thinking and "pro" in actual_model.lower():
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    elif "deepseek" in actual_model.lower():
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
+    t0 = time.time()
+    response = client.chat.completions.create(**kwargs)
+    elapsed_ms = (time.time() - t0) * 1000
+
+    choice = response.choices[0]
+    prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+    completion_tokens = response.usage.completion_tokens if response.usage else 0
+    total_tokens = response.usage.total_tokens if response.usage else 0
+
+    has_tool_calls = bool(choice.message.tool_calls)
+    logger.info(
+        "LLM 调用完成 model=%s elapsed=%.0fms tokens(in=%d out=%d total=%d) "
+        "tool_calls=%s thinking=%s",
+        actual_model, elapsed_ms, prompt_tokens, completion_tokens, total_tokens,
+        has_tool_calls,
+        "on" if enable_thinking and "pro" in actual_model.lower() else "off",
+    )
+
+    return choice, prompt_tokens, completion_tokens
 
 
 # ==========================================================================
@@ -246,6 +294,8 @@ def parse_llm_response(text: str) -> dict:
         action_match = re.search(r"Action\s*[:：]\s*(.*)", text_before_fa, re.IGNORECASE)
         if action_match:
             action_text = action_match.group(1).strip()
+            # 清理 LLM 常添加的 markdown 标记: ** `tool(args)` **
+            action_text = re.sub(r"[*`]", "", action_text).strip()
             # 解析 tool_name(arguments)
             tool_match = re.match(r"(\w+)\s*\(\s*(.*?)\s*\)\s*$", action_text, re.DOTALL)
             if tool_match:
@@ -305,57 +355,37 @@ def react_loop(
     verbose: bool = True,
     long_term_memory: Optional[list[str]] = None,
 ) -> dict:
-    """ReAct 主循环：Thought → Action → Observation
+    """ReAct 主循环 — 基于原生 tool calling
 
-    Args:
-        user_query: 用户问题
-        image_path: 可选的图片路径
-        max_steps: 最大步数
-        verbose: 是否打印中间过程
-        long_term_memory: 可选的长期记忆反思列表，注入到 User Message 前缀
-
-    Returns:
-        {
-            "answer": str,              # 最终答案
-            "trajectory": str,          # 完整推理轨迹文本
-            "steps_used": int,          # 实际使用步数
-            "terminated_reason": str,   # "final_answer" | "max_steps" | "parse_error" | "llm_error"
-            "total_prompt_tokens": int,
-            "total_completion_tokens": int,
-        }
+    LLM 通过 function calling API 调用工具，不再依赖正则解析。
+    当 LLM 返回 tool_calls 时执行工具；返回纯文本时提取 Final Answer。
     """
-    # 加载 System Prompt
     system_prompt = load_system_prompt()
     messages = [{"role": "system", "content": system_prompt}]
 
-    # 添加用户消息（含长期记忆注入）
-    user_msg = build_user_message(user_query, image_path)
-
-    # 如果有长期记忆，注入到 User Message 前缀
     if long_term_memory:
-        memory_prefix = _build_memory_prefix(long_term_memory)
-        user_msg["content"] = memory_prefix + user_msg["content"]
+        memory_sys = _build_memory_system_message(long_term_memory)
+        if memory_sys:
+            messages.append({"role": "system", "content": memory_sys})
 
+    user_msg = build_user_message(user_query, image_path)
     messages.append(user_msg)
+
+    # 生成 OpenAI tool definitions
+    tool_defs = get_openai_tool_definitions()
 
     step_count = 0
     total_prompt_tokens = 0
     total_completion_tokens = 0
-    trajectory_parts: list[str] = []  # 收集完整推理轨迹
+    trajectory_parts: list[str] = []
 
-    # ── P0: 信用分配 — 步骤效用追踪 ──
-    step_utilities: list[dict] = []   # [{"step": 1, "action": "...", "args": "...", "utility": 0.5}, ...]
-    action_history: list[tuple] = []  # [(tool_name, tool_args), ...] 用于检测重复调用
+    step_utilities: list[dict] = []
+    action_history: list[tuple] = []
 
-    # ── P0: 模型路由 — 动态升级追踪 ──
-    consecutive_parse_failures = 0
-    use_strong_model = False  # 动态升级标志
-
-    # 工具调用状态（用于控制 DeepSeek thinking 模式）
-    last_tool_success = None  # None=首次, True=成功, False=失败
+    last_tool_success = None
 
     print(f"\n{'='*60}")
-    print(f"🚀 ReAct Agent 启动")
+    print(f"🚀 ReAct Agent 启动 (tool calling 模式)")
     if image_path:
         print(f"🖼️  附带图片: {image_path}")
     print(f"🔧 可用工具: {', '.join(TOOLS.keys())}")
@@ -363,38 +393,27 @@ def react_loop(
     print(f"📏 最大步数: {max_steps}")
     print(f"{'='*60}\n")
 
-    # 清空上次会话的 extract 缓存
     clear_session_extracts()
 
     while step_count < max_steps:
         step_count += 1
 
-        # ── P0: 模型路由 — 选择当前步骤使用的模型 ──
-        if use_strong_model:
-            step_model = get_model_for_role("react_first")  # 动态升级用强模型
-        elif step_count == 1:
-            step_model = get_model_for_role("react_first")  # 首步规划用强模型
+        if step_count == 1:
+            step_model = get_model_for_role("react_first")
         else:
-            step_model = get_model_for_role("react_main")   # 后续步骤用快模型
+            step_model = get_model_for_role("react_main")
 
-        # 决定是否启用 thinking（仅 Pro 模型有效）
-        if last_tool_success is None:
-            enable_thinking = True   # 首步：需要规划
-        elif last_tool_success:
-            enable_thinking = False  # 上一步成功：直接汇总
-        else:
-            enable_thinking = True   # 上一步失败：重新推理
+        enable_thinking = (step_count == 1) or (last_tool_success is False)
 
         print(f"--- Step {step_count}/{max_steps} [模型: {step_model}] ---")
         logger.info("Step %d: 调用 LLM (model=%s thinking=%s, history=%d messages)",
                      step_count, step_model, "on" if enable_thinking else "off", len(messages))
 
-        # 调用 LLM（使用路由选择的模型）
         try:
-            # 首步 thinking=on 时 max_tokens 加倍，防止推理输出被截断
             step_max_tokens = 8192 if enable_thinking else 4096
-            response_text, prompt_tok, completion_tok = call_llm(
+            choice, prompt_tok, completion_tok = call_llm_with_tools(
                 messages,
+                tools=tool_defs,
                 enable_thinking=enable_thinking,
                 model=step_model,
                 max_tokens=step_max_tokens,
@@ -416,22 +435,101 @@ def react_loop(
                 "critical_step": _find_critical_step(step_utilities),
             }
 
-        # 记录轨迹
-        trajectory_parts.append(f"### Step {step_count}\n{response_text}")
+        msg = choice.message
+        content = msg.content or ""
 
-        # 解析响应
-        parsed = parse_llm_response(response_text)
+        # ── 情况 1: LLM 返回 tool_calls → 逐个执行所有工具 ──
+        if msg.tool_calls:
+            # 先把 assistant message（含全部 tool_calls）加入历史
+            messages.append(msg)
 
-        # 打印 Thought
+            if content and verbose:
+                print(f"💭 Thought: {content[:200]}{'...' if len(content) > 200 else ''}")
+
+            import json as _json
+
+            for tc in msg.tool_calls:
+                tool_name = tc.function.name
+                raw_args = tc.function.arguments or "{}"
+
+                try:
+                    args_dict = _json.loads(raw_args)
+                    tool_args = args_dict.get("input", "")
+                except _json.JSONDecodeError:
+                    tool_args = raw_args
+
+                # 记录轨迹（首个 tool_call 带 thought）
+                if tc is msg.tool_calls[0]:
+                    thought_str = f"Thought: {content}\n" if content else ""
+                    trajectory_parts.append(
+                        f"### Step {step_count}\n{thought_str}"
+                        f"Action: {tool_name}({tool_args[:200]})"
+                    )
+                else:
+                    trajectory_parts.append(
+                        f"Action (parallel): {tool_name}({tool_args[:200]})"
+                    )
+
+                print(f"🔧 Action: {tool_name}({tool_args[:100]}{'...' if len(tool_args) > 100 else ''})")
+
+                observation = execute_tool(tool_name, tool_args)
+                last_tool_success = not observation.startswith("[错误]")
+
+                # 信用分配
+                step_utility = _compute_step_utility(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    observation=observation,
+                    action_history=action_history,
+                )
+                step_utilities.append({
+                    "step": step_count, "action": tool_name,
+                    "args": tool_args[:100], "utility": step_utility,
+                })
+                action_history.append((tool_name, tool_args.strip()))
+
+                # 按工具类型动态截断
+                observation = _truncate_observation(tool_name, observation)
+
+                print(f"👁️  Observation: {observation[:300]}{'...' if len(observation) > 300 else ''}")
+                trajectory_parts.append(f"Observation: {observation[:500]}")
+
+                # 每个 tool_call 必须有对应的 tool response
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": observation,
+                })
+
+            # 所有 tool_calls 处理完后，对最后一个结果做中途纠偏
+            correction = _mid_trajectory_check(
+                step_count=step_count,
+                action_history=action_history,
+                step_utilities=step_utilities,
+                observation=observation,
+            )
+            if correction:
+                logger.info("Step %d: 中途纠偏触发 — %s", step_count, correction)
+                if verbose:
+                    print(f"⚡ 中途纠偏: {correction}")
+                # 纠偏提示作为 user message 注入（不能追加到 tool response 里）
+                messages.append({
+                    "role": "user",
+                    "content": f"[系统纠偏提示] {correction}",
+                })
+
+            continue
+
+        # ── 情况 2: LLM 返回纯文本 → 检查 Final Answer ──
+        messages.append({"role": "assistant", "content": content})
+        trajectory_parts.append(f"### Step {step_count}\n{content}")
+
+        parsed = parse_llm_response(content)
+
         if parsed["thought"] and verbose:
-            print(f"💭 Thought: {parsed['thought'][:200]}{'...' if len(parsed['thought']) > 200 else ''}")
+            print(f"💭 Thought: {parsed['thought'][:200]}")
 
-        # 检查是否到达 Final Answer
         if parsed["final_answer"]:
-            # ── P0: 动态升级复位 ──
-            consecutive_parse_failures = 0
-            use_strong_model = False
-
             final_answer = parsed["final_answer"]
             print(f"\n✅ Final Answer:\n{final_answer}")
             logger.info("ReAct 完成 step=%d final_answer_len=%d", step_count, len(final_answer))
@@ -449,101 +547,26 @@ def react_loop(
                 "critical_step": _find_critical_step(step_utilities),
             }
 
-        # 检查是否有 Action
-        if not parsed["action"]:
-            # ── P0: 动态升级 — 追踪连续解析失败 ──
-            consecutive_parse_failures += 1
-            if consecutive_parse_failures >= DYNAMIC_UPGRADE_THRESHOLD and not use_strong_model:
-                use_strong_model = True
-                logger.warning(
-                    "连续 %d 次解析失败，触发动态升级 → strong 模型 + thinking",
-                    consecutive_parse_failures,
-                )
-                print(f"⚡ 动态升级: 切换为强模型 (连续 {consecutive_parse_failures} 次解析失败)")
-
-            # 既没有 Final Answer 也没有 Action —— 可能是格式错误
-            logger.warning("Step %d: LLM 响应中未找到 Action 或 Final Answer", step_count)
-            print(f"⚠️  LLM 响应格式不正确，未找到 Action 或 Final Answer")
-            if verbose:
-                print(f"原始响应: {response_text[:300]}...")
-            # 将响应作为 Observation 注入，让 LLM 自我纠正
-            messages.append({"role": "assistant", "content": response_text})
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Observation: [系统提示] 你的上一条回复格式不正确。"
-                    "请严格按照以下格式输出：\n"
-                    "Thought: <分析>\n"
-                    "Action: <tool_name>(<arguments>)\n"
-                    "或者如果已有足够信息：\n"
-                    "Thought: 我有足够信息\n"
-                    "Final Answer: <答案>"
-                ),
-            })
-
-            # 记录信用分配：解析失败
-            step_utilities.append({
-                "step": step_count, "action": "_parse_error", "args": "",
-                "utility": -0.5,
-            })
-
-            last_tool_success = False
-            continue
-
-        # 执行工具
-        tool_name = parsed["action"]
-        tool_args = parsed["action_args"] or ""
-
-        print(f"🔧 Action: {tool_name}({tool_args[:100]}{'...' if len(tool_args) > 100 else ''})")
-
-        # ── P0: 动态升级复位（成功解析出 Action）──
-        if consecutive_parse_failures > 0:
-            consecutive_parse_failures = 0
-            if use_strong_model:
-                logger.info("解析恢复成功，退出动态升级模式")
-                use_strong_model = False
-
-        observation = execute_tool(tool_name, tool_args)
-        last_tool_success = not observation.startswith("[错误]")
-
-        # ── P0: 信用分配 — 计算本步效用 ──
-        step_utility = _compute_step_utility(
-            tool_name=tool_name,
-            tool_args=tool_args,
-            observation=observation,
-            action_history=action_history,
-        )
-        step_utilities.append({
-            "step": step_count,
-            "action": tool_name,
-            "args": tool_args[:100],
-            "utility": step_utility,
+        # 纯文本但没有 Final Answer — 提示 LLM 做决定
+        logger.warning("Step %d: 无 tool_calls 也无 Final Answer，提示 LLM", step_count)
+        if verbose:
+            print(f"⚠️  LLM 未调用工具也未给出答案，提示继续")
+        messages.append({
+            "role": "user",
+            "content": "请根据已有信息调用合适的工具，或直接给出 Final Answer。",
         })
-        # 记录到历史（用于检测重复调用）
-        action_history.append((tool_name, tool_args.strip()))
+        step_utilities.append({
+            "step": step_count, "action": "_no_action", "args": "",
+            "utility": -0.3,
+        })
+        last_tool_success = False
 
-        # 截断过长的 Observation
-        max_obs_len = 2000
-        if len(observation) > max_obs_len:
-            observation = observation[:max_obs_len] + f"\n...(Observation 过长，已截断至 {max_obs_len} 字符)"
-
-        print(f"👁️  Observation: {observation[:300]}{'...' if len(observation) > 300 else ''}")
-
-        # 记录 Observation 到轨迹
-        trajectory_parts.append(f"Observation: {observation[:500]}")
-
-        # 将 Assistant 回复和 Observation 注入对话历史
-        # assistant 消息保留完整响应（含 Thought 和 Action）
-        messages.append({"role": "assistant", "content": response_text})
-        # Observation 由系统以 user 角色注入
-        messages.append({"role": "user", "content": f"Observation: {observation}"})
-
-    # 达到 max_steps：触发兜底汇总
+    # 达到 max_steps：触发兜底汇总（不传 tools，强制纯文本回答）
     logger.warning("达到 max_steps=%d，触发兜底汇总", max_steps)
     print(f"\n⚠️  达到最大步数 {max_steps}，触发兜底汇总...")
 
     fallback_prompt = (
-        "你已经达到了最大步数限制。请基于以上所有 Observation 中的信息，"
+        "你已经达到了最大步数限制。请基于以上所有信息，"
         "直接给出对用户问题的最终答案。不要再调用任何工具。\n"
         "格式要求: Final Answer: <你的答案>"
     )
@@ -698,23 +721,172 @@ def _find_critical_step(step_utilities: list[dict]) -> Optional[dict]:
     return None
 
 
-def _build_memory_prefix(memories: list[str]) -> str:
-    """构建记忆注入前缀（User Message 前缀形式）
+def _truncate_observation(tool_name: str, observation: str) -> str:
+    """按工具类型和内容长度分档处理 Observation
 
-    Args:
-        memories: 反思文本列表
+    策略（避免信息丢失）：
+    - ≤ 15K chars: 原样返回，不压缩（DeepSeek 128K 窗口完全承受得住）
+    - 15K-50K chars: 三明治截断（首尾各保留，中间省略）
+    - > 50K chars: 仅保留前 8K + 结构提示，引导 Agent 用分页工具精读
+    - 短内容工具（web_search 等）: 上限 3000 chars
+    """
+    LONG_CONTENT_TOOLS = {"read_pdf", "web_fetch", "tavily_extract"}
+
+    if tool_name not in LONG_CONTENT_TOOLS:
+        max_len = 3000
+        if len(observation) <= max_len:
+            return observation
+        return observation[:max_len] + f"\n...(已截断至 {max_len} 字符)"
+
+    length = len(observation)
+
+    # 小文档: 原样返回，不丢任何信息
+    if length <= 15000:
+        return observation
+
+    # 中等文档: 三明治截断
+    if length <= 50000:
+        head_len = 6000
+        tail_len = 6000
+        head = observation[:head_len]
+        tail = observation[-tail_len:]
+        omitted = length - head_len - tail_len
+        return (
+            f"{head}\n\n"
+            f"...（中间省略 {omitted} 字符，共 {length} 字符。"
+            f"如需查看省略部分，请用更精确的搜索或分页读取）...\n\n"
+            f"{tail}"
+        )
+
+    # 超长文档: 只保留开头 + 提示 Agent 分页精读
+    head = observation[:8000]
+    return (
+        f"{head}\n\n"
+        f"...（文档共 {length} 字符，仅显示前 8000 字符。"
+        f"请根据以上内容确定需要的章节，然后用工具精确查询具体部分）..."
+    )
+
+
+def _mid_trajectory_check(
+    step_count: int,
+    action_history: list[tuple],
+    step_utilities: list[dict],
+    observation: str,
+) -> Optional[str]:
+    """中途纠偏：在 ReAct 循环内部实时检测异常并生成纠偏提示
+
+    零额外 LLM 调用，复用已有的启发式规则。
 
     Returns:
-        注入到 User Message 开头的记忆前缀字符串
+        纠偏提示字符串（需要纠偏时），或 None（正常继续）
     """
+    if step_count < 2:
+        return None
+
+    # 检测 1: 同工具+同参数重复 ≥2 次 → 立即干预
+    if len(action_history) >= 2:
+        last_action = action_history[-1]
+        repeat_count = sum(1 for a in action_history if a == last_action)
+        if repeat_count >= 2:
+            tool_name, tool_args = last_action
+            return (
+                f"你已经用相同参数调用 {tool_name} {repeat_count} 次，结果相同。"
+                f"请立即改变策略：换用不同的搜索关键词、尝试其他工具、"
+                f"或基于已有信息直接给出 Final Answer。"
+            )
+
+    # 检测 1.5: URL 级跨工具去重 — 同一 URL 被不同工具访问过 ≥2 次
+    if len(action_history) >= 2:
+        import re as _re
+        url_fetch_tools = {"web_fetch", "tavily_extract", "read_pdf"}
+        last_tool, last_args = action_history[-1]
+        if last_tool in url_fetch_tools:
+            url_match = _re.search(r"https?://[^\s]+", last_args)
+            if url_match:
+                target_url = url_match.group(0).split("?")[0].rstrip("/")
+                prev_hits = 0
+                for prev_tool, prev_args in action_history[:-1]:
+                    if prev_tool in url_fetch_tools:
+                        prev_url_match = _re.search(r"https?://[^\s]+", prev_args)
+                        if prev_url_match:
+                            prev_url = prev_url_match.group(0).split("?")[0].rstrip("/")
+                            if prev_url == target_url:
+                                prev_hits += 1
+                if prev_hits >= 1:
+                    return (
+                        f"这个 URL 已经被访问过 {prev_hits + 1} 次了（可能用了不同工具）。"
+                        f"重复访问同一 URL 不会得到新信息。"
+                        f"请换一个信息源，或基于已有信息直接回答。"
+                    )
+
+    # 检测 2: 连续工具错误 ≥2 次
+    recent_utils = step_utilities[-2:] if len(step_utilities) >= 2 else []
+    if len(recent_utils) == 2 and all(u["utility"] <= -0.3 for u in recent_utils):
+        return (
+            "最近连续 2 步工具调用都失败或无效。"
+            "请停下来重新思考：是否在用错误的工具或错误的参数？"
+            "考虑换一个工具或换一种方式获取信息。"
+        )
+
+    # 检测 3: 同一类工具调用过多（不同参数但同工具 ≥8 次）
+    if len(action_history) >= 8:
+        from collections import Counter
+        tool_counts = Counter(name for name, _ in action_history)
+        for tool_name, count in tool_counts.items():
+            if count >= 8:
+                return (
+                    f"你已经调用 {tool_name} {count} 次了。"
+                    f"搜索策略可能已经失效，请尝试：1) 用 tavily_extract 直接抓取已知 URL；"
+                    f"2) 用 wikipedia_search 查百科；3) 基于现有信息直接回答。"
+                )
+
+    # 检测 4: 观察结果太短（可能是空页面或无效响应）
+    # 排除 calculator 和 get_current_time — 它们的正常输出本身就很短
+    if observation and len(observation.strip()) < 50 and not observation.startswith("[错误]"):
+        last_tool = action_history[-1][0] if action_history else ""
+        short_output_tools = {"calculator", "get_current_time"}
+        if step_count > 3 and last_tool not in short_output_tools:
+            return (
+                "上一步返回的信息非常少（不到 50 字符），可能是空页面或无效响应。"
+                "请尝试不同的 URL 或搜索词。"
+            )
+
+    return None
+
+
+def _build_memory_prefix(memories: list[str]) -> str:
+    """构建记忆注入前缀（保留向后兼容，但不再推荐使用）"""
     if not memories:
         return ""
-
     prefix = "【重要提醒：你之前在类似任务中犯过以下错误，务必避免重蹈覆辙】\n\n"
     for i, mem in enumerate(memories, 1):
         prefix += f"教训 {i}: {mem}\n\n"
     prefix += "---\n\n"
     return prefix
+
+
+def _build_memory_system_message(memories: list[str]) -> Optional[str]:
+    """构建结构化记忆 system message（推荐方式）
+
+    将教训作为 system role 的结构化约束注入，
+    比 user message 前缀有更高的 LLM 遵从率。
+    """
+    if not memories:
+        return None
+
+    constraints = []
+    for mem in memories:
+        mem = mem.strip()
+        if mem:
+            if not mem.startswith("- "):
+                mem = f"- {mem}"
+            constraints.append(mem)
+
+    return (
+        "MANDATORY CONSTRAINTS from prior task failures "
+        "(violating these will cause task failure):\n"
+        + "\n".join(constraints)
+    )
 
 
 def _print_summary(steps: int, prompt_tokens: int, completion_tokens: int) -> None:
